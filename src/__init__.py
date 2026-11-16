@@ -1,3 +1,4 @@
+from .cache import MovieCache
 from .middleware import log_requests
 from .models import (
     HealthResponse,

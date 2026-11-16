@@ -8,6 +8,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import (
     HealthResponse,
+    MovieCache,
     MovieDataResponse,
     MovieProcessingReport,
     MovieStorage,
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Movie Database API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -82,6 +84,7 @@ async def upload_movies(file: UploadFile = File(...)):
 
     # 3. Replace the stored collection with this upload
     storage.save(df)
+    cache.invalidate()  # the stored movies changed, so old cached responses are wrong now
     logger.info(f"Uploaded movies: filename={file.filename}, rows={len(df)}")
     return MovieUploadInfo(
         filename=file.filename,
@@ -93,10 +96,20 @@ async def upload_movies(file: UploadFile = File(...)):
 
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
-    """Return up to limit stored movies plus the total count."""
+    """Return up to limit stored movies plus the total count, using the cache when possible."""
+    # 1. Cache hit: return the saved response and skip SQLite completely
+    cached = cache.get(limit)
+    if cached is not None:
+        logger.info(f"Retrieved movies from cache: returned_rows={len(cached['data'])}")
+        return cached
+
+    # 2. Cache miss: same SQL retrieval and count as Part 1
     rows = storage.select_columns(MOVIE_COLUMNS, limit)
     total_rows = storage.count_movies()
     response = {"data": rows, "total_rows": total_rows}
+
+    # 3. Save the complete response for next time, then return it
+    cache.set(limit, response)
     logger.info(f"Retrieved movies: returned_rows={len(rows)}")
     return response
 
@@ -154,6 +167,7 @@ def process_movies(config: ProcessConfig):
 
     # 8. Only now, after both steps worked, replace the stored movies
     storage.save(processed)
+    cache.invalidate()  # same reason: the stored movies just changed
     logger.info(
         f"Processed movies: validation_removed={validation_rows_removed}, "
         f"rows_before={report['rows_before']}, rows_after={report['rows_after']}"
